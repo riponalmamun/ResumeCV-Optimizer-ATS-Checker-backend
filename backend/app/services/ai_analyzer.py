@@ -1,199 +1,225 @@
-from openai import OpenAI
-from app.config import settings
-from typing import Dict, List
-import json
+from __future__ import annotations
 
-# Initialize the OpenAI client with the provided API key
-client = OpenAI(api_key=settings.OPENAI_API_KEY)
+import json
+from typing import Dict, List, Optional, Any
+
+from openai import OpenAI
+
+# ✅ FIX: correct import path inside backend/app/services
+# Your config.py is in backend/app/config.py
+from ..config import settings
+
 
 class AIAnalyzer:
+    """
+    Centralized AI analysis utility for resume review and ATS keyword suggestions.
+
+    Notes:
+    - Uses OpenAI SDK v1.x (you installed openai==1.3.0)
+    - Expects settings to provide:
+        - OPENAI_API_KEY
+        - OPENAI_MODEL
+    """
+
+    def __init__(self) -> None:
+        # Create client once per instance (better than module-global in many cases)
+        self.client = OpenAI(api_key=settings.OPENAI_API_KEY)
+
     @staticmethod
-    def analyze_resume_content(resume_text: str, job_title: str = None, 
-                               job_description: str = None) -> Dict:
-        """Use AI to deeply analyze resume content"""
-        
-        # Prepare the context with resume, job title, and job description
-        context = f"Resume Text:\n{resume_text}\n\n"
+    def _strip_code_fences(text: str) -> str:
+        """Remove ```json / ``` wrappers if model returns code fenced output."""
+        t = text.strip()
+        if t.startswith("```json"):
+            t = t[7:].strip()
+        if t.startswith("```"):
+            t = t[3:].strip()
+        if t.endswith("```"):
+            t = t[:-3].strip()
+        return t
+
+    @staticmethod
+    def _safe_json_loads(text: str) -> Any:
+        """
+        Parse JSON safely with cleanup.
+        Raises json.JSONDecodeError if parsing fails.
+        """
+        cleaned = AIAnalyzer._strip_code_fences(text)
+        return json.loads(cleaned)
+
+    def _chat_json(self, prompt: str, *, max_tokens: int = 1500, temperature: float = 0.7) -> str:
+        """
+        Call OpenAI and return raw content string.
+        Keeps one place for request settings.
+        """
+        response = self.client.chat.completions.create(
+            model=settings.OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Return ONLY valid JSON. No markdown, no explanations."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        return (response.choices[0].message.content or "").strip()
+
+    def analyze_resume_content(
+        self,
+        resume_text: str,
+        job_title: Optional[str] = None,
+        job_description: Optional[str] = None,
+    ) -> Dict:
+        """
+        Use AI to deeply analyze resume content.
+        Returns a dict matching the schema described in the prompt.
+        """
+
+        context_parts = [f"Resume Text:\n{resume_text}\n"]
         if job_title:
-            context += f"Target Job Title: {job_title}\n"
+            context_parts.append(f"Target Job Title: {job_title}\n")
         if job_description:
-            context += f"Job Description: {job_description}\n"
-        
-        prompt = f"""You are an expert resume reviewer and career coach. Analyze this resume and provide detailed feedback.
+            context_parts.append(f"Job Description: {job_description}\n")
+
+        context = "\n".join(context_parts)
+
+        prompt = f"""
+You are an expert resume reviewer and career coach. Analyze this resume and provide detailed feedback.
 
 {context}
 
-Provide your analysis in the following JSON format:
+Return JSON in this exact format:
 {{
-    "strengths": ["list of 3-5 key strengths"],
-    "improvement_suggestions": [
-        {{
-            "category": "Content/Formatting/Keywords/Impact",
-            "priority": "High/Medium/Low",
-            "issue": "specific issue found",
-            "suggestion": "actionable suggestion",
-            "example": "optional example of improvement"
-        }}
-    ],
-    "missing_elements": ["list of missing important elements"],
-    "overall_feedback": "2-3 sentences of overall assessment"
+  "strengths": ["3-5 key strengths"],
+  "improvement_suggestions": [
+    {{
+      "category": "Content/Formatting/Keywords/Impact",
+      "priority": "High/Medium/Low",
+      "issue": "specific issue found",
+      "suggestion": "actionable suggestion",
+      "example": "optional example of improvement"
+    }}
+  ],
+  "missing_elements": ["missing important elements"],
+  "overall_feedback": "2-3 sentences overall assessment"
 }}
 
 Focus on:
-1. Impact and quantifiable achievements
-2. ATS-friendly keywords for the target role
-3. Action verbs and strong language
-4. Formatting and structure
-5. Relevance to target position"""
+1) Impact and quantifiable achievements
+2) ATS-friendly keywords for the target role
+3) Action verbs and strong language
+4) Formatting and structure
+5) Relevance to target position
+""".strip()
 
         try:
-            response = client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are an expert resume reviewer. Always respond with valid JSON."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=2000
-            )
-            
-            # Extract the response content and clean it up
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up any markdown if present
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            # Parse the cleaned response into JSON
-            result = json.loads(content.strip())
+            raw = self._chat_json(prompt, max_tokens=2000, temperature=0.7)
+            result = self._safe_json_loads(raw)
+
+            # Defensive: ensure it's a dict
+            if not isinstance(result, dict):
+                raise ValueError("AI returned JSON but not an object/dict.")
+
             return result
-        
-        except json.JSONDecodeError as e:
-            # Handle invalid JSON response and return a fallback structure
+
+        except json.JSONDecodeError:
             return {
-                "strengths": ["Resume submitted successfully"],
+                "strengths": ["Resume received"],
                 "improvement_suggestions": [
                     {
                         "category": "General",
                         "priority": "Medium",
-                        "issue": "Unable to parse detailed analysis",
-                        "suggestion": "Please try again or contact support",
-                        "example": None
+                        "issue": "AI response was not valid JSON",
+                        "suggestion": "Try again (shorter resume text) or check model settings",
+                        "example": None,
                     }
                 ],
                 "missing_elements": [],
-                "overall_feedback": "Analysis could not be completed. Please try again."
+                "overall_feedback": "Analysis could not be completed due to formatting issues. Please try again.",
             }
         except Exception as e:
-            # Raise a custom error if something else goes wrong
-            raise Exception(f"AI analysis error: {str(e)}")
+            raise Exception(f"AI analysis error: {str(e)}") from e
 
-    @staticmethod
-    def analyze_sections(resume_text: str) -> List[Dict]:
-        """Analyze individual sections of the resume"""
-        
-        prompt = f"""Analyze this resume section by section. Identify each major section and provide specific feedback.
+    def analyze_sections(self, resume_text: str) -> List[Dict]:
+        """
+        Analyze resume section by section.
+        Returns list[dict].
+        """
+
+        prompt = f"""
+Analyze this resume section by section. Identify each major section and provide specific feedback.
 
 Resume:
 {resume_text}
 
-Return JSON array with this format:
+Return ONLY a JSON array in this format:
 [
-    {{
-        "section_name": "Section name (e.g., Experience, Education)",
-        "content": "Brief summary of what's in this section",
-        "issues": ["list of issues in this section"],
-        "suggestions": ["list of improvements for this section"]
-    }}
+  {{
+    "section_name": "Section name (e.g., Experience, Education)",
+    "content": "Brief summary of what's in this section",
+    "issues": ["issues in this section"],
+    "suggestions": ["improvements for this section"]
+  }}
 ]
-
-Analyze sections like: Professional Summary, Experience, Education, Skills, etc."""
+""".strip()
 
         try:
-            response = client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are an expert resume reviewer. Always respond with valid JSON array."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=1500
-            )
-            
-            # Extract and clean the response content
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up any markdown code blocks
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            # Parse and return the response
-            result = json.loads(content.strip())
+            raw = self._chat_json(prompt, max_tokens=1500, temperature=0.7)
+            result = self._safe_json_loads(raw)
+
+            if not isinstance(result, list):
+                raise ValueError("AI returned JSON but not an array/list.")
+
             return result
-        
-        except Exception as e:
-            # Return a fallback response in case of an error
+
+        except Exception:
             return [
                 {
                     "section_name": "General",
                     "content": "Resume content detected",
                     "issues": ["Detailed section analysis unavailable"],
-                    "suggestions": ["Ensure clear section headers", "Use consistent formatting"]
+                    "suggestions": ["Ensure clear section headers", "Use consistent formatting"],
                 }
             ]
-    
-    @staticmethod
-    def get_keyword_suggestions(resume_text: str, job_title: str, 
-                               job_description: str = None) -> List[str]:
-        """Get AI-suggested keywords to add"""
-        
-        # Create context based on the resume and job details
-        context = f"Job Title: {job_title}\n"
+
+    def get_keyword_suggestions(
+        self,
+        resume_text: str,
+        job_title: str,
+        job_description: Optional[str] = None,
+    ) -> List[str]:
+        """
+        Get AI suggested missing keywords to add.
+        Returns list[str].
+        """
+
+        context_parts = [f"Job Title: {job_title}"]
         if job_description:
-            context += f"Job Description: {job_description}\n"
-        context += f"\nCurrent Resume:\n{resume_text}"
-        
-        prompt = f"""Based on this job title and description, suggest 5-8 important keywords/skills that are missing from the resume but would be valuable to include.
+            context_parts.append(f"Job Description: {job_description}")
+        context_parts.append(f"Current Resume:\n{resume_text}")
+
+        context = "\n\n".join(context_parts)
+
+        prompt = f"""
+Based on the job title/description, suggest 5-8 important keywords/skills that are missing from the resume but should be included.
 
 {context}
 
-Return ONLY a JSON array of strings: ["keyword1", "keyword2", ...]
-Focus on technical skills, industry terms, and relevant qualifications."""
+Return ONLY a JSON array of strings like:
+["keyword1", "keyword2", "keyword3"]
+""".strip()
 
         try:
-            response = client.chat.completions.create(
-                model=settings.OPENAI_MODEL,
-                messages=[
-                    {"role": "system", "content": "You are a keyword optimization expert. Respond only with JSON array."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.7,
-                max_tokens=300
-            )
-            
-            # Extract and clean the response content
-            content = response.choices[0].message.content.strip()
-            
-            # Clean up any markdown
-            if content.startswith("```json"):
-                content = content[7:]
-            if content.startswith("```"):
-                content = content[3:]
-            if content.endswith("```"):
-                content = content[:-3]
-            
-            # Parse and return the keywords
-            keywords = json.loads(content.strip())
-            return keywords
-        
-        except Exception as e:
-            # Return a fallback response in case of an error
+            raw = self._chat_json(prompt, max_tokens=300, temperature=0.4)
+            result = self._safe_json_loads(raw)
+
+            if not isinstance(result, list):
+                raise ValueError("AI returned JSON but not an array/list.")
+
+            # Ensure list[str]
+            keywords: List[str] = []
+            for item in result:
+                if isinstance(item, str):
+                    keywords.append(item.strip())
+            return keywords if keywords else ["No keywords returned"]
+
+        except Exception:
             return ["Unable to generate keyword suggestions"]
