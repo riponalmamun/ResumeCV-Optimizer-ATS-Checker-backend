@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.log
+
+# Virtual Environment
+venv/
+.env
+.env.*
+
+# OS / Editor junk
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Build / Cache
+*.egg-info/
+dist/
+build/
+
+# Secrets & Config
+backend/app/config.py
+
+# Uploaded / Parsed Files
+uploads/
+parsed_resumes/
+temp/
+
+# Test & Coverage
+.coverage
+htmlcov/
+pytest_cache/
